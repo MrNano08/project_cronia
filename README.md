@@ -131,7 +131,7 @@ flutter build apk --release
 
 ## Limitaciones conocidas
 
-- El código usa `gemini-3.5-flash` en `lib/src/services/gemini_service.dart`. Según la [documentación oficial de Gemini](https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash), ese identificador está obsoleto y se redirige a `gemini-3.6-flash`. Conviene actualizarlo a un modelo estable compatible y comprobar sus condiciones de uso.
+- El código utiliza `gemini-3.5-flash` en `lib/src/services/gemini_service.dart`. Google señala que este identificador está obsoleto, pero sus solicitudes se redirigen automáticamente a `gemini-3.6-flash` ([documentación oficial](https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash)). Esto no implica que la aplicación haya dejado de funcionar; la conexión actual debe comprobarse ejecutándola con una clave válida.
 - La validación de la respuesta de IA comprueba la forma de varios campos, pero no garantiza por sí sola que se respeten todas las restricciones, como tareas inmovibles, solapamientos u horarios de descanso. Revisa las propuestas antes de aplicarlas.
 - Las notificaciones dependen de los permisos del dispositivo y utilizan programación no exacta en Android.
 - Los datos se guardan en SharedPreferences; no hay cifrado general de actividades, almacenamiento SQL ni sincronización en la nube.
@@ -146,5 +146,3 @@ Project Cronia es un proyecto de aprendizaje y desarrollo móvil orientado a org
 ## Autoría
 
 Desarrollado en el repositorio [MrNano08/project_cronia](https://github.com/MrNano08/project_cronia).
-
-La licencia de reutilización no está definida en este repositorio. Antes de aceptar contribuciones o habilitar reutilización por terceros, añade una licencia apropiada para el proyecto.
