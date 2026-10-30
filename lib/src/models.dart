@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:timezone/data/latest_all.dart' as tz_data;
+import 'package:timezone/timezone.dart' as tz;
 
 import 'theme/cronia_theme.dart';
+import 'recurrence.dart';
 
 enum TaskPriority { low, medium, high, urgent }
 
@@ -33,6 +36,8 @@ String dateTimeForGemini(DateTime value) {
       '${two(value.minute)}:'
       '${two(value.second)}';
 }
+
+bool _cronianTimeZonesInitialized = false;
 
 TaskPriority taskPriorityFromString(String? value) {
   return TaskPriority.values.firstWhere(
@@ -236,9 +241,17 @@ class AppSettings {
   }
 
   DateTime userNow() {
-    final shifted = DateTime.now().toUtc().add(
-          Duration(minutes: utcOffsetMinutes),
-        );
+    try {
+      if (!_cronianTimeZonesInitialized) {
+        tz_data.initializeTimeZones();
+        _cronianTimeZonesInitialized = true;
+      }
+      final zoned = tz.TZDateTime.from(DateTime.now().toUtc(), tz.getLocation(timeZoneId));
+      return DateTime(zoned.year, zoned.month, zoned.day, zoned.hour, zoned.minute, zoned.second, zoned.millisecond, zoned.microsecond);
+    } catch (_) {
+      // Keep old settings usable if an IANA ID is unavailable.
+    }
+    final shifted = DateTime.now().toUtc().add(Duration(minutes: utcOffsetMinutes));
 
     return DateTime(
       shifted.year,
@@ -355,6 +368,8 @@ class ReminderConfig {
 
 class CroniaTask {
   final String id;
+  final String? occurrenceSeriesId;
+  final DateTime? occurrenceDate;
   final String title;
   final String? description;
   final DateTime date;
@@ -371,9 +386,12 @@ class CroniaTask {
   final List<ReminderConfig> reminders;
   final DateTime createdAt;
   final DateTime updatedAt;
+  final RecurrenceRule? recurrence;
 
   const CroniaTask({
     required this.id,
+    this.occurrenceSeriesId,
+    this.occurrenceDate,
     required this.title,
     this.description,
     required this.date,
@@ -390,9 +408,13 @@ class CroniaTask {
     this.reminders = const [],
     required this.createdAt,
     required this.updatedAt,
+    this.recurrence,
   });
 
   CroniaTask copyWith({
+    String? id,
+    String? occurrenceSeriesId,
+    DateTime? occurrenceDate,
     String? title,
     String? description,
     DateTime? date,
@@ -408,9 +430,13 @@ class CroniaTask {
     DateTime? completedAt,
     List<ReminderConfig>? reminders,
     DateTime? updatedAt,
+    RecurrenceRule? recurrence,
+    bool clearRecurrence = false,
   }) {
     return CroniaTask(
-      id: id,
+      id: id ?? this.id,
+      occurrenceSeriesId: occurrenceSeriesId ?? this.occurrenceSeriesId,
+      occurrenceDate: occurrenceDate ?? this.occurrenceDate,
       title: title ?? this.title,
       description: description ?? this.description,
       date: date ?? this.date,
@@ -427,12 +453,15 @@ class CroniaTask {
       reminders: reminders ?? this.reminders,
       createdAt: createdAt,
       updatedAt: updatedAt ?? DateTime.now(),
+      recurrence: clearRecurrence ? null : recurrence ?? this.recurrence,
     );
   }
 
   Map<String, dynamic> toJson() {
     return {
       'id': id,
+      'occurrenceSeriesId': occurrenceSeriesId,
+      'occurrenceDate': occurrenceDate?.toIso8601String(),
       'title': title,
       'description': description,
       'date': date.toIso8601String(),
@@ -449,6 +478,7 @@ class CroniaTask {
       'reminders': reminders.map((r) => r.toJson()).toList(),
       'createdAt': createdAt.toIso8601String(),
       'updatedAt': updatedAt.toIso8601String(),
+      'recurrence': recurrence?.toJson(),
     };
   }
 
@@ -457,6 +487,8 @@ class CroniaTask {
 
     return CroniaTask(
       id: json['id'] as String,
+      occurrenceSeriesId: json['occurrenceSeriesId'] as String?,
+      occurrenceDate: json['occurrenceDate'] == null ? null : parseCroniaDateTime(json['occurrenceDate'] as String),
       title: json['title'] as String,
       description: json['description'] as String?,
       date: parseCroniaDateTime(json['date'] as String),
@@ -485,6 +517,9 @@ class CroniaTask {
           .toList(),
       createdAt: parseCroniaDateTime(json['createdAt'] as String),
       updatedAt: parseCroniaDateTime(json['updatedAt'] as String),
+      recurrence: json['recurrence'] == null
+          ? null
+          : RecurrenceRule.fromJson(Map<String, dynamic>.from(json['recurrence'] as Map)),
     );
   }
 }
@@ -539,6 +574,7 @@ class PlanningResult {
   final bool requiresUserConfirmation;
   final List<PlannedTask> tasks;
   final List<String> warnings;
+  final Map<String, dynamic>? diagnostics;
 
   const PlanningResult({
     required this.version,
@@ -546,6 +582,7 @@ class PlanningResult {
     required this.requiresUserConfirmation,
     required this.tasks,
     required this.warnings,
+    this.diagnostics,
   });
 
   factory PlanningResult.fromJson(Map<String, dynamic> json) {
@@ -561,6 +598,9 @@ class PlanningResult {
           .map((e) => PlannedTask.fromJson(Map<String, dynamic>.from(e)))
           .toList(),
       warnings: warningList.map((e) => e.toString()).toList(),
+      diagnostics: json['diagnostics'] == null
+          ? null
+          : Map<String, dynamic>.from(json['diagnostics'] as Map),
     );
   }
 }
@@ -580,6 +620,7 @@ class PlannedTask {
   final bool canBeMoved;
   final DateTime? deadline;
   final String? reason;
+  final RecurrenceRule? recurrence;
 
   const PlannedTask({
     required this.action,
@@ -596,7 +637,10 @@ class PlannedTask {
     required this.canBeMoved,
     this.deadline,
     this.reason,
+    this.recurrence,
   });
+
+  PlannedTask copyWith({String? title, DateTime? date, DateTime? startAt, DateTime? endAt}) => PlannedTask(action: action, existingTaskId: existingTaskId, title: title ?? this.title, description: description, date: date ?? this.date, startAt: startAt ?? this.startAt, endAt: endAt ?? this.endAt, durationMinutes: durationMinutes, priority: priority, status: status, isFlexible: isFlexible, canBeMoved: canBeMoved, deadline: deadline, reason: reason, recurrence: recurrence);
 
   factory PlannedTask.fromJson(Map<String, dynamic> json) {
     return PlannedTask(
@@ -620,6 +664,9 @@ class PlannedTask {
           ? null
           : parseCroniaDateTime(json['deadline'] as String),
       reason: json['reason'] as String?,
+      recurrence: json['recurrence'] == null
+          ? null
+          : RecurrenceRule.fromJson(Map<String, dynamic>.from(json['recurrence'] as Map)),
     );
   }
 }

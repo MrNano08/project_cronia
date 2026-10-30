@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models.dart';
+import '../recurrence.dart';
 import '../providers.dart';
 import '../theme/cronia_theme.dart';
 import '../widgets/cronia_ui.dart';
@@ -13,11 +14,13 @@ import '../widgets/cronia_ui.dart';
 class TaskFormScreen extends ConsumerStatefulWidget {
   final String? taskId;
   final String? initialTitle;
+  final DateTime? occurrenceDate;
 
   const TaskFormScreen({
     super.key,
     this.taskId,
     this.initialTitle,
+    this.occurrenceDate,
   });
 
   @override
@@ -43,6 +46,16 @@ class _TaskFormScreenState extends ConsumerState<TaskFormScreen> {
   TaskStatus _status = TaskStatus.pending;
   bool _isFlexible = true;
   bool _canBeMoved = true;
+  RecurrenceFrequency? _frequency;
+  int _repeatInterval = 1;
+  final Set<int> _repeatDays = {};
+  RecurrenceEnd _repeatEnd = RecurrenceEnd.never;
+  DateTime? _repeatUntil;
+  int _repeatCount = 10;
+  MonthlyPattern _monthlyPattern = MonthlyPattern.dayOfMonth;
+  int _monthlyWeekday = DateTime.monday;
+  int _weekdayPosition = 1;
+  bool _recurrenceEdited = false;
 
   bool get _isEditing => widget.taskId != null;
 
@@ -71,14 +84,48 @@ class _TaskFormScreenState extends ConsumerState<TaskFormScreen> {
       _titleController.text = task.title;
       _descriptionController.text = task.description ?? '';
       _durationController.text = task.durationMinutes.toString();
-      _selectedDate = task.date;
+      _occurrenceDate = widget.occurrenceDate;
+      if (_occurrenceDate == null && task.recurrence != null) {
+        final next = RecurrenceEngine.next(task.recurrence!, count: 1, after: now.subtract(const Duration(days: 1)));
+        if (next.isNotEmpty) _occurrenceDate = next.first;
+      }
+      _selectedDate = _occurrenceDate ?? task.date;
       final start = task.startAt ?? task.date;
       _selectedTime = TimeOfDay(hour: start.hour, minute: start.minute);
       _priority = task.priority;
       _status = task.status;
       _isFlexible = task.isFlexible;
       _canBeMoved = task.canBeMoved;
-      _loadReminderValues(task);
+      List<ReminderConfig>? loadedOverrideReminders;
+      final rule = task.recurrence;
+      if (rule != null) {
+        _frequency = rule.frequency;
+        _repeatInterval = rule.interval;
+        _repeatDays.addAll(rule.weekdays);
+        _repeatEnd = rule.end;
+        _repeatUntil = rule.endDate;
+        _repeatCount = rule.occurrenceCount ?? 10;
+        _monthlyPattern = rule.monthlyPattern;
+        _monthlyWeekday = rule.monthlyWeekday;
+        _weekdayPosition = rule.weekdayPosition;
+        final override = rule.occurrenceOverrides[RecurrenceEngine.key(_selectedDate)];
+        if (override != null) {
+          _titleController.text = override['title'] as String? ?? task.title;
+          _descriptionController.text = override['description'] as String? ?? task.description ?? '';
+          _durationController.text = (override['durationMinutes'] as int? ?? task.durationMinutes).toString();
+          final overrideStart = override['startAt'] == null ? null : DateTime.tryParse(override['startAt'] as String);
+          if (overrideStart != null) _selectedTime = TimeOfDay.fromDateTime(overrideStart);
+          _priority = taskPriorityFromString(override['priority'] as String? ?? task.priority.name);
+          _status = taskStatusFromString(override['status'] as String? ?? task.status.name);
+          final overrideDate = override['date'] == null ? null : DateTime.tryParse(override['date'] as String);
+          if (overrideDate != null) _selectedDate = overrideDate;
+          final storedReminders = override['reminders'] as List?;
+          if (storedReminders != null) {
+            loadedOverrideReminders = storedReminders.map((r) => ReminderConfig.fromJson(Map<String, dynamic>.from(r as Map))).toList();
+          }
+        }
+      }
+      _loadReminderValues(task.copyWith(reminders: loadedOverrideReminders ?? task.reminders));
     } else {
       _selectedDate = DateTime(now.year, now.month, now.day);
       _selectedTime = TimeOfDay(hour: now.hour, minute: now.minute);
@@ -258,9 +305,30 @@ class _TaskFormScreenState extends ConsumerState<TaskFormScreen> {
         reminders: _buildReminders(taskId: id, startAt: startAt, endAt: endAt),
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
+        recurrence: _frequency == null ? null : existing?.recurrence != null && !_recurrenceEdited ? existing!.recurrence : RecurrenceRule(
+          frequency: _frequency!, interval: _repeatInterval,
+          weekdays: _frequency == RecurrenceFrequency.weekly ? (_repeatDays.isEmpty ? [_selectedDate.weekday] : _repeatDays.toList()..sort()) : const [],
+          dayOfMonth: _selectedDate.day,
+          monthlyPattern: _monthlyPattern,
+          monthlyWeekday: _monthlyWeekday,
+          weekdayPosition: _weekdayPosition,
+          startDate: _selectedDate, end: _repeatEnd,
+          endDate: _repeatEnd == RecurrenceEnd.onDate ? _repeatUntil : null,
+          occurrenceCount: _repeatEnd == RecurrenceEnd.afterCount ? _repeatCount : null,
+          exceptions: existing?.recurrence?.exceptions ?? const [],
+          completedDates: existing?.recurrence?.completedDates ?? const [],
+          cancelledDates: existing?.recurrence?.cancelledDates ?? const [],
+          occurrenceOverrides: existing?.recurrence?.occurrenceOverrides ?? const {},
+        ),
       );
 
-      await ref.read(taskControllerProvider.notifier).upsert(task);
+      if (_occurrenceDate != null && existing?.recurrence != null) {
+        final scope = await _chooseRecurrenceScope();
+        if (scope == null) return;
+        await ref.read(taskControllerProvider.notifier).editOccurrence(seriesId: existing!.id, occurrenceDate: _occurrenceDate!, editedTask: task, scope: scope);
+      } else {
+        await ref.read(taskControllerProvider.notifier).upsert(task);
+      }
 
       if (!mounted) return;
 
@@ -283,14 +351,62 @@ class _TaskFormScreenState extends ConsumerState<TaskFormScreen> {
   Future<void> _markCancelled() async {
     final task = _editingTask;
     if (task == null) return;
-
-    await ref.read(taskControllerProvider.notifier).cancel(task.id);
+    try {
+      if (task.recurrence != null && _occurrenceDate != null) {
+        final scope = await _chooseRecurrenceScope();
+        if (scope == null || !mounted) return;
+        await ref.read(taskControllerProvider.notifier).cancelOccurrence(seriesId: task.id, occurrenceDate: _occurrenceDate!, scope: scope);
+      } else {
+        await ref.read(taskControllerProvider.notifier).cancel(task.id);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('No se pudo cancelar: $e')));
+      return;
+    }
 
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Actividad cancelada.')),
     );
     context.pop();
+  }
+
+  DateTime? _occurrenceDate;
+
+  Future<RecurrenceEditScope?> _chooseRecurrenceScope() => showDialog<RecurrenceEditScope>(context: context, builder: (context) => SimpleDialog(
+    title: const Text('Aplicar cambios a'),
+    children: [
+      SimpleDialogOption(onPressed: () => Navigator.pop(context, RecurrenceEditScope.occurrence), child: const Text('Solo esta ocurrencia')),
+      SimpleDialogOption(onPressed: () => Navigator.pop(context, RecurrenceEditScope.thisAndFollowing), child: const Text('Esta y las siguientes')),
+      SimpleDialogOption(onPressed: () => Navigator.pop(context, RecurrenceEditScope.series), child: const Text('Toda la serie')),
+      SimpleDialogOption(onPressed: () => Navigator.pop(context), child: const Text('Cancelar')),
+    ],
+  ));
+
+  Future<void> _deleteSeries() async {
+    final task = _editingTask;
+    if (task?.recurrence == null) return;
+    final scope = await _chooseRecurrenceScope();
+    if (scope == null || !mounted) return;
+    final confirmed = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
+      title: const Text('Confirmar eliminación'),
+      content: Text(switch (scope) {
+        RecurrenceEditScope.occurrence => 'Se eliminará solo la ocurrencia seleccionada.',
+        RecurrenceEditScope.thisAndFollowing => 'Se eliminará esta ocurrencia y todas las posteriores.',
+        RecurrenceEditScope.series => 'Se eliminará toda la serie y sus recordatorios pendientes.',
+      }),
+      actions: [TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Conservar')), FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Eliminar'))],
+    ));
+    if (confirmed != true || !mounted) return;
+    try {
+      await ref.read(taskControllerProvider.notifier).deleteOccurrence(seriesId: task!.id, occurrenceDate: _occurrenceDate ?? task.date, scope: scope);
+      if (!mounted) return;
+      context.pop();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('No se pudo eliminar: $e')));
+    }
   }
 
   @override
@@ -396,6 +512,35 @@ class _TaskFormScreenState extends ConsumerState<TaskFormScreen> {
                     ),
                   ],
                 ),
+              ),
+              const SizedBox(height: 14),
+              _SectionCard(
+                title: 'Repetir',
+                subtitle: _editingTask?.recurrence == null
+                    ? 'La regla se guarda una sola vez y las fechas se calculan en el dispositivo.'
+                    : 'Guardar cambios actualiza la serie completa; editar solo una ocurrencia todavía no está disponible.',
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  DropdownButtonFormField<RecurrenceFrequency?>(
+                    value: _frequency,
+                    decoration: const InputDecoration(labelText: 'Frecuencia', prefixIcon: Icon(Icons.repeat_rounded)),
+                    items: [const DropdownMenuItem(value: null, child: Text('Sin repetición')), ...RecurrenceFrequency.values.map((f) => DropdownMenuItem(value: f, child: Text(switch (f) { RecurrenceFrequency.daily => 'Todos los días', RecurrenceFrequency.weekdays => 'Días laborables', RecurrenceFrequency.weekly => 'Semanal', RecurrenceFrequency.monthly => 'Mensual', RecurrenceFrequency.yearly => 'Anual' })))],
+                    onChanged: (value) => setState(() { _frequency = value; _recurrenceEdited = true; }),
+                  ),
+                  if (_frequency != null) ...[
+                    const SizedBox(height: 10),
+                    if (_frequency != RecurrenceFrequency.weekdays && _frequency != RecurrenceFrequency.yearly)
+                      Row(children: [const Text('Cada'), const SizedBox(width: 12), SizedBox(width: 74, child: TextFormField(initialValue: '$_repeatInterval', keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly], decoration: const InputDecoration(suffixText: 'veces'), onChanged: (v) { _repeatInterval = (int.tryParse(v) ?? 1).clamp(1, 365).toInt(); _recurrenceEdited = true; })), const SizedBox(width: 8), Text(_frequency == RecurrenceFrequency.daily ? 'días' : _frequency == RecurrenceFrequency.weekly ? 'semanas' : 'meses')]),
+                    if (_frequency == RecurrenceFrequency.weekly) Wrap(spacing: 4, children: List.generate(7, (i) { final day = i + 1; const labels = ['L', 'M', 'X', 'J', 'V', 'S', 'D']; return FilterChip(label: Text(labels[i]), selected: _repeatDays.contains(day), onSelected: (on) => setState(() { on ? _repeatDays.add(day) : _repeatDays.remove(day); _recurrenceEdited = true; })); })),
+                    if (_frequency == RecurrenceFrequency.monthly) ...[
+                      DropdownButtonFormField<MonthlyPattern>(value: _monthlyPattern, decoration: const InputDecoration(labelText: 'Patrón mensual'), items: const [DropdownMenuItem(value: MonthlyPattern.dayOfMonth, child: Text('Día del mes')), DropdownMenuItem(value: MonthlyPattern.weekdayPosition, child: Text('Posición del día de la semana'))], onChanged: (v) => setState(() { _monthlyPattern = v ?? MonthlyPattern.dayOfMonth; _recurrenceEdited = true; })),
+                      if (_monthlyPattern == MonthlyPattern.weekdayPosition) Row(children: [Expanded(child: DropdownButtonFormField<int>(value: _weekdayPosition, decoration: const InputDecoration(labelText: 'Posición'), items: const [DropdownMenuItem(value: 1, child: Text('Primero')), DropdownMenuItem(value: 2, child: Text('Segundo')), DropdownMenuItem(value: 3, child: Text('Tercero')), DropdownMenuItem(value: 4, child: Text('Cuarto')), DropdownMenuItem(value: -1, child: Text('Último'))], onChanged: (v) => setState(() { _weekdayPosition = v ?? 1; _recurrenceEdited = true; }))), const SizedBox(width: 10), Expanded(child: DropdownButtonFormField<int>(value: _monthlyWeekday, decoration: const InputDecoration(labelText: 'Día'), items: const [DropdownMenuItem(value: DateTime.monday, child: Text('Lunes')), DropdownMenuItem(value: DateTime.tuesday, child: Text('Martes')), DropdownMenuItem(value: DateTime.wednesday, child: Text('Miércoles')), DropdownMenuItem(value: DateTime.thursday, child: Text('Jueves')), DropdownMenuItem(value: DateTime.friday, child: Text('Viernes')), DropdownMenuItem(value: DateTime.saturday, child: Text('Sábado')), DropdownMenuItem(value: DateTime.sunday, child: Text('Domingo'))], onChanged: (v) => setState(() { _monthlyWeekday = v ?? DateTime.monday; _recurrenceEdited = true; })))])
+                    ],
+                    DropdownButtonFormField<RecurrenceEnd>(value: _repeatEnd, decoration: const InputDecoration(labelText: 'Finalizar'), items: const [DropdownMenuItem(value: RecurrenceEnd.never, child: Text('Nunca')), DropdownMenuItem(value: RecurrenceEnd.onDate, child: Text('En una fecha')), DropdownMenuItem(value: RecurrenceEnd.afterCount, child: Text('Después de ocurrencias'))], onChanged: (value) => setState(() { _repeatEnd = value ?? RecurrenceEnd.never; _recurrenceEdited = true; })),
+                    if (_repeatEnd == RecurrenceEnd.afterCount) TextFormField(initialValue: '$_repeatCount', keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Cantidad de ocurrencias'), onChanged: (v) { _repeatCount = (int.tryParse(v) ?? 1).clamp(1, 10000).toInt(); _recurrenceEdited = true; }),
+                    if (_repeatEnd == RecurrenceEnd.onDate) ListTile(title: Text(_repeatUntil == null ? 'Seleccionar fecha final' : DateFormat('dd/MM/yyyy').format(_repeatUntil!)), trailing: const Icon(Icons.calendar_month), onTap: () async { final picked = await showDatePicker(context: context, initialDate: _repeatUntil ?? _selectedDate.add(const Duration(days: 30)), firstDate: _selectedDate, lastDate: DateTime(2100)); if (picked != null) setState(() { _repeatUntil = picked; _recurrenceEdited = true; }); }),
+                    if (_frequency != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text('Próximas fechas: ${RecurrenceEngine.next(RecurrenceRule(frequency: _frequency!, interval: _repeatInterval, weekdays: _repeatDays.toList(), startDate: _selectedDate, end: _repeatEnd, endDate: _repeatUntil, occurrenceCount: _repeatCount, dayOfMonth: _selectedDate.day, monthlyPattern: _monthlyPattern, monthlyWeekday: _monthlyWeekday, weekdayPosition: _weekdayPosition), count: 5, after: _selectedDate.subtract(const Duration(days: 1))).map((d) => DateFormat('dd/MM').format(d)).join(', ')}', style: const TextStyle(color: CroniaColors.muted, fontWeight: FontWeight.w600))),
+                  ],
+                ]),
               ),
               const SizedBox(height: 14),
               _SectionCard(
@@ -518,6 +663,10 @@ class _TaskFormScreenState extends ConsumerState<TaskFormScreen> {
                 label: Text(_saving ? 'Guardando...' : 'Guardar actividad'),
               ),
               if (_isEditing) ...[
+                if (_editingTask?.recurrence != null) ...[
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(onPressed: _saving ? null : _deleteSeries, icon: const Icon(Icons.delete_outline), label: const Text('Eliminar repetición…')),
+                ],
                 const SizedBox(height: 10),
                 OutlinedButton.icon(
                   onPressed: _saving ? null : _markCancelled,

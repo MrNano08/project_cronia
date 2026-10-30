@@ -5,6 +5,7 @@ import 'package:uuid/uuid.dart';
 
 import '../models.dart';
 import '../providers.dart';
+import '../services/notification_service.dart';
 import '../theme/cronia_theme.dart';
 import '../widgets/cronia_ui.dart';
 
@@ -17,6 +18,7 @@ class SettingsScreen extends ConsumerStatefulWidget {
 
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final _apiKeyController = TextEditingController();
+  final _modelController = TextEditingController(text: 'gemini-2.5-flash');
   final _importController = TextEditingController();
   final _countryController = TextEditingController();
   final _stateController = TextEditingController();
@@ -42,6 +44,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   @override
   void dispose() {
     _apiKeyController.dispose();
+    _modelController.dispose();
     _importController.dispose();
     _countryController.dispose();
     _stateController.dispose();
@@ -58,6 +61,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final repo = ref.read(localRepositoryProvider);
     final settings = await repo.getSettings();
     final meals = await repo.getMealBlocks();
+    final model = await ref.read(secureStorageProvider).getGeminiModel();
 
     if (!mounted) return;
 
@@ -69,6 +73,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       _timeZoneId = settings.timeZoneId;
       _utcOffsetMinutes = settings.utcOffsetMinutes;
       _meals = meals;
+      _modelController.text = model;
       _loading = false;
     });
   }
@@ -78,7 +83,13 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
     if (value.isEmpty) return;
 
-    await ref.read(secureStorageProvider).saveGeminiApiKey(value);
+    try {
+      await ref.read(secureStorageProvider).saveGeminiApiKey(value);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('No se pudo guardar la API key: $e')));
+      return;
+    }
 
     if (!mounted) return;
 
@@ -87,6 +98,30 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
 
     _apiKeyController.clear();
+  }
+
+  Future<void> _saveModel() async {
+    try {
+      await ref.read(secureStorageProvider).saveGeminiModel(_modelController.text);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Modelo guardado.')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+    }
+  }
+
+  Future<void> _verifyModels() async {
+    try {
+      final available = await ref.read(geminiServiceProvider).listModels();
+      if (!mounted) return;
+      final selected = _modelController.text.trim().replaceFirst('models/', '');
+      final exists = available.contains(selected);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(exists ? 'Modelo disponible para generateContent.' : 'El modelo no aparece entre los modelos disponibles para esta API key.')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+    }
   }
 
   Future<void> _saveSettings() async {
@@ -111,7 +146,20 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       sleepTime: sleepTime,
     );
 
-    await ref.read(localRepositoryProvider).saveSettings(settings);
+    try {
+      await ref.read(localRepositoryProvider).saveSettings(settings);
+      for (final task in ref.read(taskControllerProvider)) {
+        try {
+          await NotificationService.instance.scheduleForTask(task, settings: settings);
+        } catch (_) {
+          // Keep the saved settings even when the OS rejects a notification.
+        }
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('No se pudo guardar la configuración: $e')));
+      return;
+    }
 
     if (!mounted) return;
 
@@ -511,6 +559,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     prefixIcon: Icon(Icons.key_outlined),
                   ),
                 ),
+                const SizedBox(height: 10),
+                TextField(controller: _modelController, decoration: const InputDecoration(labelText: 'Identificador de modelo', hintText: 'gemini-2.5-flash', prefixIcon: Icon(Icons.memory_outlined))),
+                const SizedBox(height: 8),
+                Row(children: [Expanded(child: OutlinedButton(onPressed: _verifyModels, child: const Text('Verificar disponibilidad'))), const SizedBox(width: 8), Expanded(child: FilledButton.tonal(onPressed: _saveModel, child: const Text('Guardar modelo')))]),
                 const SizedBox(height: 8),
                 SizedBox(
                   width: double.infinity,

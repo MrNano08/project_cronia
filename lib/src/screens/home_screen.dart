@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 
 import '../models.dart';
 import '../providers.dart';
+import '../recurrence.dart';
 import '../theme/cronia_theme.dart';
 import '../widgets/cronia_ui.dart';
 
@@ -115,13 +116,26 @@ class _TaskCard extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final formatter = DateFormat('dd/MM/yyyy HH:mm');
-    final dateText = task.startAt == null
-        ? DateFormat('dd/MM/yyyy').format(task.date)
-        : formatter.format(task.startAt!);
+    final nextOccurrences = task.recurrence == null
+        ? const <DateTime>[]
+        : RecurrenceEngine.next(task.recurrence!, count: 1);
+    final recurringDate = nextOccurrences.isEmpty ? null : nextOccurrences.first;
+    final occurrenceOverride = recurringDate == null ? null : task.recurrence!.occurrenceOverrides[RecurrenceEngine.key(recurringDate)];
+    final movedDate = occurrenceOverride?['date'] == null ? null : DateTime.tryParse(occurrenceOverride!['date'] as String);
+    final date = movedDate ?? recurringDate ?? task.date;
+    final overrideStart = occurrenceOverride?['startAt'] == null ? null : DateTime.tryParse(occurrenceOverride!['startAt'] as String);
+    final displayStart = overrideStart ?? (task.startAt == null ? null : DateTime(date.year, date.month, date.day, task.startAt!.hour, task.startAt!.minute));
+    final title = occurrenceOverride?['title'] as String? ?? task.title;
+    final priority = taskPriorityFromString(occurrenceOverride?['priority'] as String? ?? task.priority.name);
+    final status = taskStatusFromString(occurrenceOverride?['status'] as String? ?? task.status.name);
+    final duration = (occurrenceOverride?['durationMinutes'] as num?)?.toInt() ?? task.durationMinutes;
+    final dateText = displayStart == null
+        ? DateFormat('dd/MM/yyyy').format(date)
+        : formatter.format(displayStart);
 
     return CroniaCard(
       padding: EdgeInsets.zero,
-      onTap: () => context.push('/task/${task.id}/edit'),
+      onTap: () => context.push('/task/${task.id}/edit', extra: recurringDate),
       borderColor: CroniaColors.line,
       child: ClipRRect(
         borderRadius: BorderRadius.circular(22),
@@ -131,7 +145,7 @@ class _TaskCard extends ConsumerWidget {
             children: [
               Container(
                 width: 6,
-                color: task.priority.color,
+                color: priority.color,
               ),
               Expanded(
                 child: Padding(
@@ -146,10 +160,10 @@ class _TaskCard extends ConsumerWidget {
                             width: 46,
                             height: 46,
                             decoration: BoxDecoration(
-                              color: task.priority.color.withValues(alpha: 0.10),
+                              color: priority.color.withValues(alpha: 0.10),
                               borderRadius: BorderRadius.circular(16),
                               border: Border.all(
-                                color: task.priority.color.withValues(alpha: 0.18),
+                                color: priority.color.withValues(alpha: 0.18),
                               ),
                             ),
                             child: Icon(
@@ -162,15 +176,18 @@ class _TaskCard extends ConsumerWidget {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text(
-                                  task.title,
+                                Row(children: [
+                                Expanded(child: Text(
+                                  title,
                                   style: const TextStyle(
                                     color: CroniaColors.ink,
                                     fontSize: 17,
                                     fontWeight: FontWeight.w900,
                                     letterSpacing: -0.2,
                                   ),
-                                ),
+                                )),
+                                if (task.recurrence != null) const Padding(padding: EdgeInsets.only(left: 5), child: Icon(Icons.repeat_rounded, size: 17, color: CroniaColors.primary)),
+                                ]),
                                 const SizedBox(height: 5),
                                 Row(
                                   children: [
@@ -196,7 +213,7 @@ class _TaskCard extends ConsumerWidget {
                           ),
                           IconButton(
                             visualDensity: VisualDensity.compact,
-                            onPressed: () => context.push('/task/${task.id}/edit'),
+                            onPressed: () => context.push('/task/${task.id}/edit', extra: recurringDate),
                             icon: const Icon(Icons.edit_rounded, size: 19),
                             tooltip: 'Editar actividad',
                           ),
@@ -208,17 +225,17 @@ class _TaskCard extends ConsumerWidget {
                         runSpacing: 8,
                         children: [
                           _InfoChip(
-                            label: task.priority.label,
-                            color: task.priority.color,
+                            label: priority.label,
+                            color: priority.color,
                             leading: Icons.flag_rounded,
                           ),
                           _InfoChip(
-                            label: task.status.label,
+                            label: status.label,
                             color: CroniaColors.primary,
                             leading: Icons.circle_rounded,
                           ),
                           _InfoChip(
-                            label: '${task.durationMinutes} min',
+                            label: '$duration min',
                             color: CroniaColors.muted,
                             leading: Icons.timer_rounded,
                           ),
@@ -230,7 +247,7 @@ class _TaskCard extends ConsumerWidget {
                         runSpacing: 4,
                         children: [
                           TextButton.icon(
-                            onPressed: task.status == TaskStatus.inProgress
+                            onPressed: status == TaskStatus.inProgress
                                 ? null
                                 : () => ref
                                     .read(taskControllerProvider.notifier)
@@ -246,9 +263,9 @@ class _TaskCard extends ConsumerWidget {
                             label: const Text('Completar'),
                           ),
                           TextButton.icon(
-                            onPressed: () => ref
-                                .read(taskControllerProvider.notifier)
-                                .cancel(task.id),
+                            onPressed: task.recurrence != null
+                                ? () => context.push('/task/${task.id}/edit', extra: recurringDate)
+                                : () => ref.read(taskControllerProvider.notifier).cancel(task.id),
                             icon: const Icon(Icons.close_rounded, size: 18),
                             label: const Text('Cancelar'),
                           ),

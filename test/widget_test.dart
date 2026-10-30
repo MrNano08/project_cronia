@@ -22,6 +22,6 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Project-Cronia'), findsOneWidget);
-    expect(find.text('Configura tu asistente de planificación.'), findsOneWidget);
+    expect(find.text('Tu asistente de planificación con IA, horarios y recordatorios.'), findsOneWidget);
   });
 }

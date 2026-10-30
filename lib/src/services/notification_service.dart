@@ -1,19 +1,25 @@
+import 'dart:convert';
+
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:timezone/data/latest_all.dart' as tz_data;
 import 'package:timezone/timezone.dart' as tz;
 
 import '../models.dart';
+import '../recurrence.dart';
 
-class NotificationService {
+class NotificationService with WidgetsBindingObserver {
   NotificationService._();
 
   static final NotificationService instance = NotificationService._();
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
+  Future<void> Function()? onResume;
 
   Future<void> init() async {
+    WidgetsBinding.instance.addObserver(this);
     tz_data.initializeTimeZones();
 
     try {
@@ -47,6 +53,19 @@ class NotificationService {
         );
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refreshOnResume();
+  }
+
+  Future<void> _refreshOnResume() async {
+    try {
+      await onResume?.call();
+    } catch (_) {
+      // Keep lifecycle restoration from interrupting the visible application.
+    }
+  }
+
   Future<void> scheduleForTask(
     CroniaTask task, {
     required AppSettings settings,
@@ -58,7 +77,42 @@ class NotificationService {
       return;
     }
 
-    for (int i = 0; i < task.reminders.length; i++) {
+    final pending = await _plugin.pendingNotificationRequests();
+    var scheduledCount = pending.length;
+    if (task.recurrence != null && task.startAt != null) {
+      final now = settings.userNow();
+      final occurrences = RecurrenceEngine.between(task.recurrence!, now, now.add(const Duration(days: 30)), limit: 30).toList();
+      for (final entry in task.recurrence!.occurrenceOverrides.entries) {
+        final movedDate = entry.value['date'] == null ? null : DateTime.tryParse(entry.value['date'] as String);
+        final identityDate = DateTime.tryParse(entry.key);
+        if (movedDate != null && identityDate != null && !movedDate.isBefore(now) && !movedDate.isAfter(now.add(const Duration(days: 30))) && !occurrences.any((d) => RecurrenceEngine.key(d) == entry.key)) {
+          occurrences.add(identityDate);
+        }
+      }
+      occurrences.sort();
+      for (final day in occurrences) {
+        final key = RecurrenceEngine.key(day);
+        final override = task.recurrence!.occurrenceOverrides[key];
+        final actualDate = override?['date'] == null ? day : DateTime.tryParse(override!['date'] as String) ?? day;
+        final overrideStart = override?['startAt'] == null ? null : DateTime.tryParse(override!['startAt'] as String);
+        final occurrenceStart = overrideStart ?? DateTime(actualDate.year, actualDate.month, actualDate.day, task.startAt!.hour, task.startAt!.minute);
+        final storedReminders = override?['reminders'] as List?;
+        final reminders = storedReminders == null ? task.reminders : storedReminders.map((raw) => ReminderConfig.fromJson(Map<String, dynamic>.from(raw as Map))).toList();
+        final duration = (override?['durationMinutes'] as num?)?.toInt() ?? task.durationMinutes;
+        if (occurrenceStart.isAfter(now.add(const Duration(days: 30)))) continue;
+        for (var i = 0; i < reminders.length && scheduledCount < 450; i++) {
+          final reminder = reminders[i];
+          if (!reminder.enabled) continue;
+          final scheduledAt = _scheduledForOccurrence(task, reminder, occurrenceStart, duration);
+          if (scheduledAt.isBefore(now)) continue;
+          await _schedule(id: _notificationId('${task.id}@$key', i), title: _titleForReminder(task, reminder), body: _bodyForReminder(task, reminder), scheduledAt: scheduledAt, timeZoneId: settings.timeZoneId, payload: 'cronia:${task.id}:$key');
+          scheduledCount++;
+        }
+      }
+      return;
+    }
+
+    for (int i = 0; i < task.reminders.length && scheduledCount < 450; i++) {
       final reminder = task.reminders[i];
 
       if (!reminder.enabled) continue;
@@ -70,11 +124,19 @@ class NotificationService {
         body: _bodyForReminder(task, reminder),
         scheduledAt: reminder.scheduledAt,
         timeZoneId: settings.timeZoneId,
+        payload: 'cronia:${task.id}:single',
       );
+      scheduledCount++;
     }
   }
 
   Future<void> cancelForTask(String taskId) async {
+    final pending = await _plugin.pendingNotificationRequests();
+    for (final request in pending) {
+      if (request.payload?.startsWith('cronia:$taskId:') ?? false) {
+        await _plugin.cancel(request.id);
+      }
+    }
     for (int i = 0; i < 12; i++) {
       await _plugin.cancel(_notificationId(taskId, i));
     }
@@ -86,6 +148,7 @@ class NotificationService {
     required String body,
     required DateTime scheduledAt,
     required String timeZoneId,
+    String? payload,
   }) async {
     const androidDetails = AndroidNotificationDetails(
       'cronia_tasks',
@@ -120,6 +183,7 @@ class NotificationService {
       scheduled,
       details,
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      payload: payload,
     );
   }
 
@@ -132,7 +196,32 @@ class NotificationService {
   }
 
   int _notificationId(String taskId, int index) {
-    return (taskId.hashCode + index).abs() % 2147483647;
+    // Stable FNV-1a; Dart String.hashCode is intentionally process-randomized.
+    var hash = 0x811c9dc5;
+    for (final byte in utf8.encode('$taskId#$index')) {
+      hash = ((hash ^ byte) * 0x01000193) & 0x7fffffff;
+    }
+    return hash == 0 ? 1 : hash;
+  }
+
+  DateTime _scheduledForOccurrence(CroniaTask task, ReminderConfig reminder, DateTime start, int duration) {
+    switch (reminder.type) {
+      case ReminderType.daysBefore:
+        final days = reminder.daysBefore ?? 0;
+        return DateTime(start.year, start.month, start.day - days, start.hour, start.minute);
+      case ReminderType.hoursBefore:
+        return start.subtract(Duration(hours: reminder.hoursBefore ?? 0));
+      case ReminderType.minutesBefore:
+      case ReminderType.beforeStart:
+        return start.subtract(Duration(minutes: reminder.minutesBefore ?? 15));
+      case ReminderType.atStart:
+        return start;
+      case ReminderType.atEnd:
+        return start.add(Duration(minutes: duration));
+      case ReminderType.followUpAfterEnd:
+        final oldEnd = task.endAt ?? task.startAt!.add(Duration(minutes: task.durationMinutes));
+        return start.add(Duration(minutes: duration)).add(reminder.scheduledAt.difference(oldEnd));
+    }
   }
 
   String _titleForReminder(CroniaTask task, ReminderConfig reminder) {

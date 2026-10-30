@@ -5,6 +5,7 @@ import 'package:table_calendar/table_calendar.dart';
 
 import '../models.dart';
 import '../providers.dart';
+import '../recurrence.dart';
 import '../theme/cronia_theme.dart';
 import '../widgets/cronia_ui.dart';
 
@@ -23,9 +24,7 @@ class _CalendarScreenState extends ConsumerState<CalendarScreen> {
   Widget build(BuildContext context) {
     final tasks = ref.watch(taskControllerProvider);
 
-    final selectedTasks = tasks.where((task) {
-      return isSameDay(task.date, _selectedDay);
-    }).toList();
+    final selectedTasks = _tasksOnDay(tasks, _selectedDay);
 
     return CroniaBackground(
       child: Scaffold(
@@ -55,7 +54,7 @@ class _CalendarScreenState extends ConsumerState<CalendarScreen> {
                     focusedDay: _focusedDay,
                     selectedDayPredicate: (day) => isSameDay(day, _selectedDay),
                     eventLoader: (day) {
-                      return tasks.where((task) => isSameDay(task.date, day)).toList();
+                      return _tasksOnDay(tasks, day);
                     },
                     onDaySelected: (selectedDay, focusedDay) {
                       setState(() {
@@ -161,7 +160,7 @@ class _CalendarScreenState extends ConsumerState<CalendarScreen> {
                             index: index,
                             child: CroniaCard(
                               padding: const EdgeInsets.all(14),
-                              onTap: () => context.push('/task/${task.id}/edit'),
+                              onTap: () => context.push('/task/${task.occurrenceSeriesId ?? task.id}/edit', extra: task.occurrenceSeriesId == null ? null : task.occurrenceDate),
                               borderColor: task.priority.color.withValues(alpha: 0.18),
                               child: Row(
                                 children: [
@@ -173,7 +172,7 @@ class _CalendarScreenState extends ConsumerState<CalendarScreen> {
                                       borderRadius: BorderRadius.circular(17),
                                     ),
                                     child: Icon(
-                                      Icons.task_alt_rounded,
+                                      task.recurrence == null ? Icons.task_alt_rounded : Icons.repeat_rounded,
                                       color: task.priority.color,
                                     ),
                                   ),
@@ -191,7 +190,7 @@ class _CalendarScreenState extends ConsumerState<CalendarScreen> {
                                         ),
                                         const SizedBox(height: 4),
                                         Text(
-                                          '${task.priority.label} · ${task.status.label}',
+                                          '${task.priority.label} · ${task.status.label}${task.recurrence == null ? '' : ' · Recurrente'}',
                                           style: const TextStyle(
                                             color: CroniaColors.muted,
                                             fontWeight: FontWeight.w600,
@@ -218,4 +217,43 @@ class _CalendarScreenState extends ConsumerState<CalendarScreen> {
       ),
     );
   }
+
+  List<CroniaTask> _tasksOnDay(List<CroniaTask> tasks, DateTime day) {
+    final matches = <CroniaTask>[];
+    for (final task in tasks) {
+      final rule = task.recurrence;
+      if (rule == null) {
+        if (isSameDay(task.date, day)) matches.add(task);
+        continue;
+      }
+      final dates = RecurrenceEngine.between(rule, day, day, limit: 1);
+      if (dates.isNotEmpty) {
+        final key = RecurrenceEngine.key(dates.first);
+        final override = rule.occurrenceOverrides[key];
+        final overrideDate = override?['date'] == null ? dates.first : DateTime.tryParse(override!['date'] as String) ?? dates.first;
+        if (isSameDay(overrideDate, day)) matches.add(_occurrenceTask(task, dates.first, override));
+      }
+      for (final entry in rule.occurrenceOverrides.entries) {
+        if (dates.isNotEmpty && entry.key == RecurrenceEngine.key(dates.first)) continue;
+        final movedDate = entry.value['date'] == null ? DateTime.tryParse(entry.key) : DateTime.tryParse(entry.value['date'] as String);
+        if (movedDate != null && isSameDay(movedDate, day)) matches.add(_occurrenceTask(task, DateTime.tryParse(entry.key) ?? movedDate, entry.value));
+      }
+    }
+    matches.sort((a, b) => (a.startAt ?? a.date).compareTo(b.startAt ?? b.date));
+    return matches;
+  }
+
+  CroniaTask _occurrenceTask(CroniaTask master, DateTime identityDate, Map<String, dynamic>? override) {
+    final date = override?['date'] == null ? identityDate : DateTime.tryParse(override!['date'] as String) ?? identityDate;
+    final start = override?['startAt'] == null
+        ? (master.startAt == null ? null : DateTime(date.year, date.month, date.day, master.startAt!.hour, master.startAt!.minute))
+        : DateTime.tryParse(override!['startAt'] as String);
+    final duration = (override?['durationMinutes'] as num?)?.toInt() ?? master.durationMinutes;
+    final remindersJson = override?['reminders'] as List?;
+    final reminders = remindersJson == null
+        ? master.reminders
+        : remindersJson.map((item) => ReminderConfig.fromJson(Map<String, dynamic>.from(item as Map))).toList();
+    return master.copyWith(id: RecurrenceEngine.occurrenceId(master.id, identityDate), occurrenceSeriesId: master.id, occurrenceDate: identityDate, title: override?['title'] as String? ?? master.title, description: override?['description'] as String? ?? master.description, date: DateTime(date.year, date.month, date.day), startAt: start, endAt: start == null ? null : start.add(Duration(minutes: duration)), durationMinutes: duration, priority: taskPriorityFromString(override?['priority'] as String? ?? master.priority.name), status: taskStatusFromString(override?['status'] as String? ?? master.status.name), reminders: reminders);
+  }
+
 }

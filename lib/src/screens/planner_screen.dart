@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
 
 import '../models.dart';
 import '../providers.dart';
@@ -70,11 +71,33 @@ class _PlannerScreenState extends ConsumerState<PlannerScreen> {
     final result = _result;
     if (result == null) return;
 
-    final controller = ref.read(taskControllerProvider.notifier);
+    final current = ref.read(taskControllerProvider);
+    final affectedIds = result.tasks.map((t) => t.existingTaskId).whereType<String>().toSet();
+    final proposed = result.tasks.where((t) => t.action != 'delete_request' && t.action != 'cancel' && t.startAt != null && t.endAt != null).toList();
+    final conflicts = <String>{};
+    for (var i = 0; i < proposed.length; i++) {
+      final p = proposed[i];
+      final existing = current.where((task) => !affectedIds.contains(task.id) && task.status != TaskStatus.cancelled && task.status != TaskStatus.completed && task.startAt != null && task.endAt != null);
+      for (final task in existing) {
+        if (p.startAt!.isBefore(task.endAt!) && p.endAt!.isAfter(task.startAt!)) conflicts.add('${p.title} coincide con ${task.title}.');
+      }
+      for (var j = i + 1; j < proposed.length; j++) {
+        final other = proposed[j];
+        if (p.startAt!.isBefore(other.endAt!) && p.endAt!.isAfter(other.startAt!)) conflicts.add('${p.title} coincide con ${other.title}.');
+      }
+    }
+    if (conflicts.isNotEmpty) {
+      if (!mounted) return;
+      await showDialog<void>(context: context, builder: (context) => AlertDialog(title: const Text('Revisa los horarios'), content: Text(conflicts.join('\n')), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Entendido'))]));
+      return;
+    }
 
-    for (final task in result.tasks) {
-      if (task.action == 'delete_request') continue;
-      await controller.applyPlannedTask(task);
+    try {
+      await ref.read(taskControllerProvider.notifier).applyPlannedTasks(result.tasks);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString().replaceFirst('Bad state: ', ''))));
+      return;
     }
 
     if (!mounted) return;
@@ -87,6 +110,32 @@ class _PlannerScreenState extends ConsumerState<PlannerScreen> {
       _result = null;
       _controller.clear();
     });
+  }
+
+  Future<void> _editProposal(int index) async {
+    final current = _result;
+    if (current == null || index < 0 || index >= current.tasks.length) return;
+    final task = current.tasks[index];
+    final title = TextEditingController(text: task.title);
+    var date = task.date;
+    var time = task.startAt == null ? const TimeOfDay(hour: 9, minute: 0) : TimeOfDay.fromDateTime(task.startAt!);
+    final saved = await showDialog<bool>(context: context, builder: (dialogContext) => StatefulBuilder(builder: (dialogContext, refresh) => AlertDialog(
+      title: const Text('Editar propuesta'),
+      content: Column(mainAxisSize: MainAxisSize.min, children: [
+        TextField(controller: title, decoration: const InputDecoration(labelText: 'Título')),
+        ListTile(contentPadding: EdgeInsets.zero, title: const Text('Fecha'), subtitle: Text(DateFormat('dd/MM/yyyy').format(date)), onTap: () async { final picked = await showDatePicker(context: dialogContext, initialDate: date, firstDate: DateTime(2024), lastDate: DateTime(2100)); if (picked != null) refresh(() => date = picked); }),
+        ListTile(contentPadding: EdgeInsets.zero, title: const Text('Hora'), subtitle: Text(time.format(dialogContext)), onTap: () async { final picked = await showTimePicker(context: dialogContext, initialTime: time); if (picked != null) refresh(() => time = picked); }),
+      ]),
+      actions: [TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancelar')), FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Guardar'))],
+    )));
+    final editedTitle = title.text.trim();
+    title.dispose();
+    if (saved != true || !mounted) return;
+    final start = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    final updated = task.copyWith(title: editedTitle.isEmpty ? task.title : editedTitle, date: DateTime(date.year, date.month, date.day), startAt: start, endAt: start.add(Duration(minutes: task.durationMinutes)));
+    final tasks = List<PlannedTask>.from(current.tasks);
+    tasks[index] = updated;
+    setState(() => _result = PlanningResult(version: current.version, summary: current.summary, requiresUserConfirmation: current.requiresUserConfirmation, tasks: tasks, warnings: current.warnings, diagnostics: current.diagnostics));
   }
 
   void _openManualForm() {
@@ -171,7 +220,7 @@ class _PlannerScreenState extends ConsumerState<PlannerScreen> {
                 child: AnimatedSwitcher(
                   duration: const Duration(milliseconds: 300),
                   child: result != null
-                      ? _PlanningPreview(result: result, onApply: _applyPlan)
+                      ? _PlanningPreview(result: result, onApply: _applyPlan, onEdit: _editProposal)
                       : const CroniaEmptyState(
                           icon: Icons.tips_and_updates_rounded,
                           title: 'Esperando instrucciones',
@@ -191,8 +240,9 @@ class _PlannerScreenState extends ConsumerState<PlannerScreen> {
 class _PlanningPreview extends StatelessWidget {
   final PlanningResult result;
   final VoidCallback onApply;
+  final ValueChanged<int> onEdit;
 
-  const _PlanningPreview({required this.result, required this.onApply});
+  const _PlanningPreview({required this.result, required this.onApply, required this.onEdit});
 
   @override
   Widget build(BuildContext context) {
@@ -288,7 +338,7 @@ class _PlanningPreview extends StatelessWidget {
                             ),
                             const SizedBox(height: 4),
                             Text(
-                              '${task.action} · ${task.durationMinutes} min · ${task.priority.label}',
+                              '${task.startAt == null ? DateFormat('dd/MM/yyyy').format(task.date) : DateFormat('EEE dd/MM · HH:mm').format(task.startAt!)} · ${task.durationMinutes} min · ${task.priority.label}${task.recurrence == null ? '' : ' · Repite: ${task.recurrence!.frequency.name}'}',
                               style: const TextStyle(
                                 color: CroniaColors.muted,
                                 fontWeight: FontWeight.w600,
@@ -297,6 +347,7 @@ class _PlanningPreview extends StatelessWidget {
                           ],
                         ),
                       ),
+                      IconButton(onPressed: () => onEdit(index), icon: const Icon(Icons.edit_outlined), tooltip: 'Editar propuesta'),
                     ],
                   ),
                 ),

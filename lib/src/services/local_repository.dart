@@ -76,7 +76,7 @@ class LocalRepository {
 
     final backup = {
       'app': 'Project-Cronia',
-      'schemaVersion': '1.1',
+      'schemaVersion': '1.2',
       'exportedAt': DateTime.now().toIso8601String(),
       'userProfile': profile?.toJson(),
       'settings': settings.toJson(),

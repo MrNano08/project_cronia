@@ -52,7 +52,7 @@ class CroniaApp extends StatelessWidget {
         GoRoute(
           path: '/task/:id/edit',
           builder: (context, state) {
-            return TaskFormScreen(taskId: state.pathParameters['id']);
+            return TaskFormScreen(taskId: state.pathParameters['id'], occurrenceDate: state.extra is DateTime ? state.extra as DateTime : null);
           },
         ),
       ],
